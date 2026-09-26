@@ -57,6 +57,21 @@ python src/05_train.py
 python src/06_tune.py
 ```
 
+**3. Test set → submission.** After the full training run:
+
+```bash
+python src/01_clean.py --split test
+python src/03_block.py --split test
+python src/04_features.py --split test
+python src/07_predict.py
+python src/08_write_submission.py
+```
+
+This writes `output/matching_results.tsv` (upload this) and `output/candidate_pairs.tsv`,
+then runs the organisers' validator (must print `PASS`).
+Quick first submission before the full training finishes: run the three `--split test`
+commands, then `python src/07_predict.py --models sample0.05` and `python src/08_write_submission.py`.
+
 Outputs go to `work/sample0.05/` or `work/full/`. Every step skips work that already
 exists; add `--force` to redo a step. Set `ER_JOBS=8` to limit CPU threads.
 
@@ -74,6 +89,7 @@ exists; add `--force` to redo a step. Set `ER_JOBS=8` to limit CPU threads.
 
 | File | Role |
 |---|---|
+| `src/00_download_data.py` | download the challenge zip from Google Drive → `data/train`, `data/test` |
 | `src/config.py` | paths, settings (TOP_K, MAX_DF, LightGBM params, sample mode) |
 | `src/normalize.py` | all cleaning rules for names and addresses (`python src/normalize.py` shows examples) |
 | `src/features.py` | pair features (rapidfuzz fuzzy scores, exact matches, relative/rank features) |
@@ -84,3 +100,5 @@ exists; add `--force` to redo a step. Set `ER_JOBS=8` to limit CPU threads.
 | `src/04_features.py` | features for every candidate pair |
 | `src/05_train.py` | LightGBM 5-fold, out-of-fold predictions, models |
 | `src/06_tune.py` | decision rule search + validation macro F0.5 |
+| `src/07_predict.py` | score test pairs with the 5 fold models (averaged) |
+| `src/08_write_submission.py` | one-owner rule + decision rule → both TSVs → validator |
