@@ -1,0 +1,12 @@
+# data and generated files (too big for git)
+data/
+work/
+student_resource/dataset/
+*.mp4
+
+# environments / OS
+.venv/
+venv/
+__pycache__/
+*.pyc
+.DS_Store
