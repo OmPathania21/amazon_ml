@@ -39,6 +39,7 @@ def clean_frame(df, pool):
         out[f] = parts[f]
     out["is_domain"] = out.is_domain.astype(np.int8)
     out["addr_missing"] = out.addr_missing.astype(np.int8)
+    out["name_nonascii"] = out.name_nonascii.astype(np.int8)
     assert out.key.is_unique, "entity id -> key collision"
     return out
 
@@ -81,6 +82,7 @@ def main():
                 print(f"     {len(df):,} records", flush=True)
                 clean = clean_frame(df, pool)
                 clean.to_parquet(out, index=False)
+                (out_dir / f"translit_applied_{args.split}.flag").unlink(missing_ok=True)
                 del df, clean
 
     if args.split == "train":

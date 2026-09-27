@@ -24,9 +24,12 @@ N_JOBS = int(os.environ.get("ER_JOBS", os.cpu_count() or 4))
 SEED = 42
 N_FOLDS = 5
 
-# ---- blocking ----
-TOP_K = 5                 # S1 candidates kept per S2/S3 record
-MAX_DF = 400              # drop blocking tokens found in more S1 records than this
+# ---- blocking (v2: three passes) ----
+TOP_K = 5                 # (used only in reports)
+PASS_K = {"combo": 3, "name": 3, "addr": 3}   # S1 candidates per S2/S3 record, per pass
+PRUNE_RATIO = 0.75        # keep a non-top candidate only if score >= ratio * best of that pass
+MAX_DF = 400              # minimum document-frequency cap for blocking tokens
+MAX_DF_FRAC = 0.003       # cap grows with the country's S1 size (0.3% of its S1 records)
 BLOCK_CHUNK = 50_000      # S2/S3 records per sparse matmul chunk
 
 # ---- features ----
@@ -37,7 +40,7 @@ MAX_TRAIN_ROWS = 6_000_000   # rows sampled per fold for training
 MAX_VALID_ROWS = 1_000_000   # rows of the held-out fold used for early stopping
 LGB_PARAMS = dict(
     objective="binary",
-    learning_rate=0.05,
+    learning_rate=0.1,
     num_leaves=127,
     min_data_in_leaf=200,
     feature_fraction=0.8,
@@ -49,8 +52,8 @@ LGB_PARAMS = dict(
     verbose=-1,
     seed=SEED,
 )
-NUM_BOOST_ROUND = 3000
-EARLY_STOP = 100
+NUM_BOOST_ROUND = 2000
+EARLY_STOP = 50
 
 SOURCES = (1, 2, 3)
 META_COLS = ["s1", "cand", "label", "fold", "country"]

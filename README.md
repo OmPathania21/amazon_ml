@@ -42,6 +42,7 @@ All outputs are written inside this folder: `work/` (intermediate files) and `ou
 ```bash
 python src/01_clean.py --sample 0.05
 python src/02_labels_folds.py --sample 0.05
+python src/02b_translit.py --sample 0.05
 python src/03_block.py --sample 0.05
 python src/04_features.py --sample 0.05
 python src/05_train.py --sample 0.05
@@ -53,6 +54,7 @@ python src/06_tune.py --sample 0.05
 ```bash
 python src/01_clean.py
 python src/02_labels_folds.py
+python src/02b_translit.py
 python src/03_block.py
 python src/04_features.py
 python src/05_train.py
@@ -63,6 +65,7 @@ python src/06_tune.py
 
 ```bash
 python src/01_clean.py --split test
+python src/02b_translit.py --split test
 python src/03_block.py --split test
 python src/04_features.py --split test
 python src/07_predict.py
@@ -105,7 +108,8 @@ exists; add `--force` to redo a step. Set `ER_JOBS=8` to limit CPU threads.
 | `src/metrics.py` | macro F0.5, one-owner rule, threshold / expected-F0.5 decision rules |
 | `src/01_clean.py` | raw TSV → cleaned parquet per source |
 | `src/02_labels_folds.py` | ground truth lookup + 5 folds grouped by Source-1 entity |
-| `src/03_block.py` | TF-IDF token blocking: top-K S1 per S2/S3 record, per country |
+| `src/02b_translit.py` | learns a native-script → English word dictionary from training pairs and applies it |
+| `src/03_block.py` | blocking v2: three TF-IDF passes (combined / name / address tokens), union + pruning, per country |
 | `src/04_features.py` | features for every candidate pair |
 | `src/05_train.py` | LightGBM 5-fold, out-of-fold predictions, models |
 | `src/06_tune.py` | decision rule search + validation macro F0.5 |

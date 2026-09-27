@@ -6,6 +6,7 @@ state/region names and their common codes (incl. native-script spellings), used
 to put the state in its own field.
 """
 import re
+import zlib
 
 from unidecode import unidecode
 
@@ -111,6 +112,11 @@ def _core(tokens):
     return core or [t for t in tokens if t not in NAME_STOP] or tokens
 
 
+def is_nonlatin(raw):
+    """True if the name is written in a non-Latin script (Devanagari, Telugu, ...)."""
+    return any(c.isalpha() and ord(c) > 0x024F for c in raw or "")
+
+
 def clean_name(raw):
     s = to_ascii(raw).strip()
     s = MS_RE.sub(" ", s)
@@ -138,6 +144,7 @@ def clean_name(raw):
         "name_nospace": "".join(core),
         "name_legal": " ".join(legal),
         "is_domain": is_domain,
+        "name_nonascii": int(is_nonlatin(raw)),
     }
 
 
@@ -279,43 +286,61 @@ def clean_address(raw):
 # --------------------------------------------------------------------------
 # blocking tokens
 # --------------------------------------------------------------------------
-def block_tokens(n, a):
-    """Space separated, prefixed tokens used to find candidates."""
-    toks = set()
-    words = n["name_core"].split() + n["name_alt"].split()
-    for t in words:
-        if len(t) >= 2:
-            toks.add("n_" + t)
-            if not t.isdigit():
-                k = skel(t)
-                if len(k) >= 2:
-                    toks.add("k_" + k)
-    if len(n["name_nospace"]) >= 4:
-        toks.add("z_" + n["name_nospace"])
-    for t in a["addr_clean"].split():
-        if len(t) >= 3 and not t.isdigit():
-            toks.add("a_" + t)
-    if a["house_no"]:
-        toks.add("h_" + a["house_no"])
-    if a["postcode"]:
-        toks.add("p_" + a["postcode"])
-    for d in a["numbers"].split():
-        if len(d) >= 2:
-            toks.add("d_" + d)
-    return " ".join(sorted(toks))
+def _h64(tok):
+    """Stable 64-bit hash of a token (identical on every machine and process)."""
+    b = tok.encode()
+    return ((zlib.crc32(b) << 32) | zlib.adler32(b)) - (1 << 63)
+
+
+def blocking_tokens(name_core, name_alt, name_nospace, addr_clean, house_no, postcode, numbers):
+    """Three token sets per record, one per blocking pass:
+      name  : name words, consonant skeletons, joined name, skeleton pairs
+      addr  : address words, house number, postcode, numbers, number x street-word pairs
+      combo : rare combinations that pin down one business even in a huge dataset:
+              number x name skeleton, postcode x name skeleton, street word x name skeleton,
+              name skeleton pairs, joined name
+    Returned as three lists of 64-bit hashes."""
+    words = [w for w in (name_core.split() + name_alt.split()) if len(w) >= 2]
+    sk = list(dict.fromkeys(skel(w) for w in words if not w.isdigit()))
+    sk = [k for k in sk if len(k) >= 2][:5]
+    pairs = [f"{x}_{y}" for i, x in enumerate(sorted(sk)) for y in sorted(sk)[i + 1:]]
+    atoks = addr_clean.split()
+    aw = [t for t in atoks if len(t) >= 3 and not any(c.isdigit() for c in t)]
+    nums = [t for t in atoks if any(c.isdigit() for c in t)][:3]
+
+    name = {"n_" + w for w in words} | {"k_" + k for k in sk} | {"kk_" + p for p in pairs}
+    if len(name_nospace) >= 4:
+        name.add("z_" + name_nospace)
+
+    addr = {"a_" + w for w in aw}
+    if house_no:
+        addr.add("h_" + house_no)
+    if postcode:
+        addr.add("p_" + postcode)
+    addr |= {"d_" + d for d in numbers.split() if len(d) >= 2}
+    addr |= {f"ha_{n}_{w}" for n in nums for w in aw[:4]}
+
+    combo = {"kk_" + p for p in pairs}
+    if len(name_nospace) >= 4:
+        combo.add("z_" + name_nospace)
+    for k in sk:
+        combo |= {f"hk_{n}_{k}" for n in nums}
+        if postcode:
+            combo.add(f"pk_{postcode}_{k}")
+    for k in sk[:3]:
+        combo |= {f"ak_{w}_{k}" for w in aw[:4]}
+    return ([_h64(t) for t in combo], [_h64(t) for t in name], [_h64(t) for t in addr])
 
 
 def clean_record(name, addr):
     n = clean_name(name)
     a = clean_address(addr)
-    out = {**n, **a}
-    out["btok"] = block_tokens(n, a)
-    return out
+    return {**n, **a}
 
 
 FIELDS = ["name_clean", "name_core", "name_key", "name_alt", "name_skel", "name_nospace",
-          "name_legal", "is_domain", "addr_clean", "house_no", "postcode", "state",
-          "numbers", "landmark", "addr_missing", "btok"]
+          "name_legal", "is_domain", "name_nonascii", "addr_clean", "house_no", "postcode",
+          "state", "numbers", "landmark", "addr_missing"]
 
 
 if __name__ == "__main__":

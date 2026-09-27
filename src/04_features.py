@@ -12,7 +12,8 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 import config as C
-from features import REC_COLS, group_features, query_relative, string_features
+from features import (REC_COLS, group_features, partner_features, partner_keys, query_relative,
+                      string_features)
 
 def safe_name(name):
     return re.sub(r"[^A-Za-z0-9]+", "_", str(name)) or "none"
@@ -73,6 +74,7 @@ def main():
         c = c.sort_values(["cand", "rank"], kind="stable").reset_index(drop=True)
         with C.Timer(f"features {args.split} {tag}: {len(c):,} pairs"):
             c = group_features(c)
+            c["partner"], c["partner_sc"] = partner_keys(c)
             if args.split == "train":
                 pos = tidx.get_indexer(c.cand.to_numpy())
                 true_s1 = np.where(pos >= 0, tval[np.maximum(pos, 0)], -1)
@@ -92,7 +94,12 @@ def main():
                 ch = c.iloc[lo:hi].reset_index(drop=True)
                 a = take(s1t, s1i.get_indexer(ch.s1.to_numpy()))
                 b = take(qt, qi.get_indexer(ch.cand.to_numpy()))
-                ch = pd.concat([ch, pd.DataFrame(string_features(a, b))], axis=1)
+                pidx = qi.get_indexer(ch.partner.to_numpy())
+                has_p = pidx >= 0
+                p = take(qt, np.where(has_p, pidx, 0))
+                pf = partner_features(b, p, has_p, ch.partner_sc.to_numpy())
+                ch = ch.drop(columns=["partner", "partner_sc"])
+                ch = pd.concat([ch, pd.DataFrame(string_features(a, b)), pd.DataFrame(pf)], axis=1)
                 ch = query_relative(ch)
                 ch["country"] = country
                 ch.to_parquet(out_dir / f"{tag}_{i:04d}.parquet", index=False)

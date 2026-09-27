@@ -3,6 +3,8 @@
 Each side is a dict {column name: list of str/int}, aligned row by row.
 Fuzzy scores are 0-100 floats from rapidfuzz (compiled, multithreaded).
 """
+import re
+
 import numpy as np
 import pandas as pd
 from rapidfuzz import fuzz
@@ -13,7 +15,7 @@ import config as C
 
 STR_COLS = ["name_clean", "name_core", "name_key", "name_alt", "name_skel", "name_nospace",
             "name_legal", "addr_clean", "house_no", "postcode", "state", "numbers", "landmark"]
-INT_COLS = ["is_domain", "addr_missing"]
+INT_COLS = ["is_domain", "addr_missing", "name_nonascii"]
 REC_COLS = STR_COLS + INT_COLS
 
 
@@ -65,6 +67,14 @@ def string_features(a, b):
         [bool(x) and bool(y) and x != y and (x.endswith(y) or y.endswith(x) or x.startswith(y) or y.startswith(x))
          for x, y in zip(a["house_no"], b["house_no"])], np.int8)
 
+    ha, hb = _house_int(a["house_no"]), _house_int(b["house_no"])
+    both = (ha >= 0) & (hb >= 0)
+    f["house_numdiff"] = np.where(both, np.abs(ha - hb), -1).astype(np.float32)
+    f["house_numreldiff"] = np.where(both, np.abs(ha - hb) / np.maximum(np.maximum(ha, hb), 1), -1).astype(np.float32)
+    f["house_numeq"] = (both & (ha == hb)).astype(np.int8)
+    f["nonascii_a"] = np.asarray(a["name_nonascii"], np.int8)
+    f["nonascii_b"] = np.asarray(b["name_nonascii"], np.int8)
+
     jac, common = [], []
     for x, y in zip(a["numbers"], b["numbers"]):
         sx, sy = set(x.split()), set(y.split())
@@ -87,6 +97,42 @@ def string_features(a, b):
     f["ntok_a"] = np.array([x.count(" ") + 1 if x else 0 for x in ca], np.int8)
     f["ntok_b"] = np.array([x.count(" ") + 1 if x else 0 for x in cb], np.int8)
     return f
+
+
+_LEAD_INT = re.compile(r"(\d+)")
+
+
+def _house_int(values):
+    out = np.full(len(values), -1, np.float64)
+    for i, v in enumerate(values):
+        m = _LEAD_INT.search(v) if v else None
+        if m and len(m.group(1)) <= 9:
+            out[i] = int(m.group(1))
+    return out
+
+
+def partner_keys(c):
+    """For each pair, the S1 entity's strongest OTHER candidate (by blocking score);
+    -1 when the entity has no other candidate."""
+    o = c[["s1", "cand", "score"]].sort_values(["s1", "score"], ascending=[True, False], kind="stable")
+    first = o.drop_duplicates("s1").set_index("s1")
+    second = o[o.duplicated("s1")].drop_duplicates("s1").set_index("s1")
+    b1 = first.cand.reindex(c.s1).to_numpy()
+    b2 = second.cand.reindex(c.s1).fillna(-1).to_numpy().astype(np.int64)
+    s1 = first.score.reindex(c.s1).to_numpy()
+    s2 = second.score.reindex(c.s1).fillna(0).to_numpy()
+    is_best = b1 == c.cand.to_numpy()
+    return np.where(is_best, b2, b1), np.where(is_best, s2, s1).astype(np.float32)
+
+
+def partner_features(b, p, has_p, p_score):
+    """Similarity of the candidate to the S1 entity's strongest other candidate:
+    records of the same business in S2 and S3 agree with each other."""
+    f = {}
+    f["partner_name_sim"] = np.where(has_p, _cd(b["name_core"], p["name_core"], fuzz.token_set_ratio), -1)
+    f["partner_addr_sim"] = np.where(has_p, _cd(b["addr_clean"], p["addr_clean"], fuzz.token_set_ratio), -1)
+    f["partner_score"] = np.where(has_p, p_score, 0).astype(np.float32)
+    return {k: np.asarray(v, np.float32) for k, v in f.items()}
 
 
 def group_features(c):
@@ -124,4 +170,5 @@ def feature_columns(df):
     return [c for c in df.columns if c not in C.META_COLS]
 
 
-__all__ = ["REC_COLS", "string_features", "group_features", "query_relative", "feature_columns", "pd"]
+__all__ = ["REC_COLS", "string_features", "group_features", "query_relative", "feature_columns",
+           "partner_keys", "partner_features", "pd"]
