@@ -14,6 +14,7 @@ candidate set per Source-1 entity small.
 Output: work/<run>/cand_<split>_<country>.parquet
         s1, cand, score (sum of pass scores), rank, sc_combo, sc_name, sc_addr, n_pass
 """
+import os
 import re
 from multiprocessing import Pool
 
@@ -28,6 +29,7 @@ from normalize import blocking_tokens
 PASSES = ["combo", "name", "addr"]
 TOK_COLS = ["name_core", "name_alt", "name_nospace", "addr_clean", "house_no", "postcode", "numbers"]
 SUB = 5_000
+MAX_WORKERS = 8          # tokenizer processes (each holds a copy of Python + libraries)
 
 
 def safe(name):
@@ -135,31 +137,54 @@ def report(d, cands, split, n_s1):
     print(f"   positives among candidates: {len(hit) / len(cands):.3f}")
 
 
+def load_country(d, split, srcs, country, cols):
+    return pd.concat([pd.read_parquet(d / f"clean_{split}_s{s}.parquet", columns=cols,
+                                      filters=[("country", "==", country)]) for s in srcs],
+                     ignore_index=True)
+
+
+def read_ok(path):
+    """Read a finished candidate file; None if it is missing or damaged (interrupted save)."""
+    if not path.exists():
+        return None
+    try:
+        return pd.read_parquet(path)
+    except Exception:
+        print(f"[redo] {path.name} is damaged (interrupted save) - recomputing")
+        path.unlink()
+        return None
+
+
 def main():
     args = C.parse_args("Step 3: blocking v2", split=True)
     d = C.work_dir(args)
     cols = ["key", "country"] + TOK_COLS
-    s1 = pd.read_parquet(d / f"clean_{args.split}_s1.parquet", columns=cols)
-    q = pd.concat([pd.read_parquet(d / f"clean_{args.split}_s{s}.parquet", columns=cols) for s in (2, 3)],
-                  ignore_index=True)
+    countries = sorted(pd.read_parquet(d / f"clean_{args.split}_s1.parquet", columns=["country"]).country.unique())
+    n_s1 = 0
     frames = []
-    with Pool(C.N_JOBS) as pool:
-        for country in sorted(s1.country.unique()):
+    with Pool(min(C.N_JOBS, MAX_WORKERS)) as pool:
+        for country in countries:
             out = d / f"cand_{args.split}_{safe(country)}.parquet"
-            if out.exists() and not args.force:
+            done = None if args.force else read_ok(out)
+            s1c = load_country(d, args.split, [1], country, cols)
+            n_s1 += len(s1c)
+            if done is not None:
                 print(f"[skip] {out.name} exists")
-                frames.append(pd.read_parquet(out))
+                frames.append(done[["s1", "cand", "rank", "sc_combo", "sc_name", "sc_addr"]])
                 continue
-            s1c = s1[s1.country == country].reset_index(drop=True)
-            qc = q[q.country == country].reset_index(drop=True)
+            qc = load_country(d, args.split, [2, 3], country, cols)
             with C.Timer(f"block {args.split} {country}: {len(s1c):,} S1 x {len(qc):,} S2/S3"):
                 cands = block_country(s1c, qc, pool)
+                del qc
                 if cands is None:
                     continue
                 print(f"     {len(cands):,} candidate pairs ({len(cands) / max(len(s1c), 1):.1f} per S1)")
-                cands.to_parquet(out, index=False)
-            frames.append(cands)
-    report(d, pd.concat(frames, ignore_index=True), args.split, len(s1))
+                tmp = out.with_name(out.name + ".tmp")
+                cands.to_parquet(tmp, index=False)
+                os.replace(tmp, out)
+            frames.append(cands[["s1", "cand", "rank", "sc_combo", "sc_name", "sc_addr"]])
+            del cands, s1c
+    report(d, pd.concat(frames, ignore_index=True), args.split, n_s1)
 
 
 if __name__ == "__main__":
