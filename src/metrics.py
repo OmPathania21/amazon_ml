@@ -59,17 +59,32 @@ def select_expected_f(best, floor=0.0):
     return b[keep]
 
 
+THRESH_GRID = np.round(np.arange(0.30, 0.951, 0.01), 3)
+EXPF_GRID = np.round(np.arange(0.0, 0.951, 0.025), 3)
+
+
 def search(best, s1_index, n_true):
-    """Try both decision rules over a grid; return (results table, best row)."""
+    """Try both decision rules over a fine grid; return (results table, best row)."""
     rows = []
-    for t in np.round(np.arange(0.05, 0.96, 0.025), 3):
-        f = macro_f05(select_threshold(best, t), s1_index, n_true).mean()
-        rows.append(("threshold", t, f))
-    for t in np.round(np.arange(0.0, 0.951, 0.05), 3):
-        f = macro_f05(select_expected_f(best, t), s1_index, n_true).mean()
-        rows.append(("expected_f", t, f))
+    for t in THRESH_GRID:
+        rows.append(("threshold", t, macro_f05(select_threshold(best, t), s1_index, n_true).mean()))
+    for t in EXPF_GRID:
+        rows.append(("expected_f", t, macro_f05(select_expected_f(best, t), s1_index, n_true).mean()))
     res = pd.DataFrame(rows, columns=["method", "param", "f05"])
     return res, res.loc[res.f05.idxmax()]
+
+
+def apply_decision(best, dec):
+    """Apply a decision.json: per-country rules where tuned, the global rule elsewhere
+    (e.g. France, which is not in the training data)."""
+    per = dec.get("per_country", {})
+    if not per or "country" not in best.columns:
+        return apply_rule(best, dec["method"], dec["param"])
+    parts = []
+    for country, g in best.groupby("country", sort=False):
+        r = per.get(str(country), dec)
+        parts.append(apply_rule(g, r["method"], r["param"]))
+    return pd.concat(parts, ignore_index=True) if parts else best.iloc[:0]
 
 
 def apply_rule(best, method, param):

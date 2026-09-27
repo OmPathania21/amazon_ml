@@ -63,13 +63,15 @@ def main():
     models_run = (d / "test_pred_models.txt").read_text().strip()
     dec = json.loads((C.WORK_ROOT / (args.decision or models_run) / "decision.json").read_text())
     print(f"decision rule: {dec['method']} param={dec['param']} (validation F0.5 {dec['val_f05']:.5f})")
+    if dec.get("per_country"):
+        print(f"per-country rules: {dec['per_country']}  (other countries use the global rule)")
 
     pred = pd.read_parquet(d / "test_pred.parquet")
     s1 = pd.read_parquet(d / "clean_test_s1.parquet", columns=["key", "entity_id"])
     cidx, cids = id_lookup(d)
 
     best = M.assign_best(pred)
-    chosen = M.apply_rule(best, dec["method"], dec["param"])
+    chosen = M.apply_decision(best, dec)
     print(f"pairs: candidates {len(pred):,}  after one-owner {len(best):,}  matched {len(chosen):,}")
     per = chosen.groupby("s1").size().reindex(s1.key.to_numpy(), fill_value=0)
     print(f"S1 with no match: {(per == 0).mean():.4f}   mean matches: {per.mean():.3f}")

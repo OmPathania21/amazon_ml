@@ -54,8 +54,26 @@ def main():
     print(f"   pair precision {tp.sum() / max(npred.sum(), 1):.4f}   pair recall {tp.sum() / n_true.sum():.4f}")
     print(f"   singletons predicted empty: {(npred[n_true == 0] == 0).mean():.4f}")
 
-    (d / "decision.json").write_text(json.dumps(
-        {"method": top.method, "param": float(top.param), "val_f05": float(f.mean())}, indent=2))
+    dec = {"method": top.method, "param": float(top.param), "val_f05": float(f.mean())}
+
+    # per-country rules (countries seen in training); unseen countries keep the global rule
+    with C.Timer("search per-country decision rules"):
+        per = {}
+        for country, g in best.groupby("country", sort=False):
+            m = info.country.to_numpy() == country
+            _, t = M.search(g, pd.Index(info.s1.to_numpy()[m]), n_true[m])
+            per[str(country)] = {"method": t.method, "param": float(t.param)}
+            print(f"   {country}: {t.method} param={t.param:.3f}  F0.5={t.f05:.5f}")
+    dec_pc = dict(dec, per_country=per)
+    f_pc = M.macro_f05(M.apply_decision(best, dec_pc), s1_index, n_true)
+    report("CHOSEN per-country rules", f_pc, info)
+    if f_pc.mean() > f.mean():
+        dec = dict(dec_pc, val_f05=float(f_pc.mean()))
+        print(f"   -> using per-country rules (+{f_pc.mean() - f.mean():.5f})")
+    else:
+        print("   -> per-country rules do not help; keeping the global rule")
+
+    (d / "decision.json").write_text(json.dumps(dec, indent=2))
     print(f"\nsaved {d / 'decision.json'}")
 
 
