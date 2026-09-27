@@ -4,7 +4,7 @@ Pipeline: **clean → block → features → LightGBM (5-fold) → decision rule
 
 ## Setup (once)
 
-Use Python 3.10–3.12.
+Use Python 3.13 (results were produced with Python 3.13.1 on Windows 11; `requirements.txt` pins the exact package versions).
 
 ```bash
 git clone <repo-url>
@@ -72,6 +72,13 @@ then runs the organisers' validator (must print `PASS`).
 Quick first submission before the full training finishes: run the three `--split test`
 commands, then `python src/07_predict.py --models sample0.05` and `python src/08_write_submission.py`.
 
+**4. Error analysis and final package.**
+
+```bash
+python src/09_error_analysis.py                  # TP/FP/FN, causes, examples -> work/full/error_analysis.md
+python src/10_make_zip.py --team "<team name>"   # -> <team>_submission.zip
+```
+
 Outputs go to `work/sample0.05/` or `work/full/`. Every step skips work that already
 exists; add `--force` to redo a step. Set `ER_JOBS=8` to limit CPU threads.
 
@@ -102,3 +109,5 @@ exists; add `--force` to redo a step. Set `ER_JOBS=8` to limit CPU threads.
 | `src/06_tune.py` | decision rule search + validation macro F0.5 |
 | `src/07_predict.py` | score test pairs with the 5 fold models (averaged) |
 | `src/08_write_submission.py` | one-owner rule + decision rule → both TSVs → validator |
+| `src/09_error_analysis.py` | pair-level TP/FP/FN, entity outcomes, blocking quality, error causes, examples |
+| `src/10_make_zip.py` | builds `<team>_submission.zip` in the required layout |
