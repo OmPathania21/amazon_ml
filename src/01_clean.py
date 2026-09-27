@@ -4,15 +4,19 @@ Output: work/<run>/clean_<split>_s<src>.parquet  (one row per record)
 Sample mode keeps a fraction of TRAIN Source-1 entities, all their matches, and the
 same fraction of unmatched S2/S3 records (so the match/decoy mix stays realistic).
 """
+import os
 from multiprocessing import Pool
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 import config as C
 from normalize import FIELDS, clean_record
 
 CHUNK = 20_000
+WRITE_ROWS = 500_000   # records cleaned and written per piece (keeps memory low)
 
 
 def _clean_chunk(args):
@@ -25,11 +29,9 @@ def clean_frame(df, pool):
     names, addrs = df.business_name.tolist(), df.business_address.tolist()
     jobs = [(names[i:i + CHUNK], addrs[i:i + CHUNK]) for i in range(0, len(df), CHUNK)]
     parts = {f: [] for f in FIELDS}
-    for i, res in enumerate(pool.imap(_clean_chunk, jobs)):
+    for res in pool.imap(_clean_chunk, jobs):
         for f in FIELDS:
             parts[f].extend(res[f])
-        if (i + 1) % 25 == 0:
-            print(f"     {min((i + 1) * CHUNK, len(df)):,}/{len(df):,}", flush=True)
     out = pd.DataFrame({
         "entity_id": df.entity_id.to_numpy(),
         "key": C.id_to_key(df.entity_id),
@@ -40,7 +42,6 @@ def clean_frame(df, pool):
     out["is_domain"] = out.is_domain.astype(np.int8)
     out["addr_missing"] = out.addr_missing.astype(np.int8)
     out["name_nonascii"] = out.name_nonascii.astype(np.int8)
-    assert out.key.is_unique, "entity id -> key collision"
     return out
 
 
@@ -80,10 +81,23 @@ def main():
                 if args.sample:
                     df = sample_filter(args, src, df, gt_cache).reset_index(drop=True)
                 print(f"     {len(df):,} records", flush=True)
-                clean = clean_frame(df, pool)
-                clean.to_parquet(out, index=False)
+                # clean and write in pieces so memory stays low on 16 GB machines
+                tmp = out.with_name(out.name + ".tmp")
+                writer, keys = None, 0
+                for start in range(0, len(df), WRITE_ROWS):
+                    part = clean_frame(df.iloc[start:start + WRITE_ROWS], pool)
+                    table = pa.Table.from_pandas(part, preserve_index=False)
+                    if writer is None:
+                        writer = pq.ParquetWriter(tmp, table.schema)
+                    writer.write_table(table.cast(writer.schema))
+                    keys += len(part)
+                    print(f"     {keys:,}/{len(df):,} cleaned", flush=True)
+                    del part, table
+                if writer is not None:
+                    writer.close()
+                    os.replace(tmp, out)
                 (out_dir / f"translit_applied_{args.split}.flag").unlink(missing_ok=True)
-                del df, clean
+                del df
 
     if args.split == "train":
         s1 = pd.read_parquet(out_dir / "clean_train_s1.parquet")

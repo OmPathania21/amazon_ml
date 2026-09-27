@@ -22,6 +22,8 @@ import os
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 import config as C
 from normalize import GENERIC, skel
@@ -60,11 +62,10 @@ def remap(text, mapping):
     return " ".join(mapping.get(w, w) for w in text.split())
 
 
-def apply(path, mapping):
-    df = pd.read_parquet(path)
+def _apply_df(df, mapping):
     m = (df.name_nonascii == 1).to_numpy()
     if not m.any():
-        return 0
+        return df, 0
     sub = df.loc[m, NAME_COLS].copy()
     for c in NAME_COLS:
         sub[c] = [remap(x, mapping) for x in sub[c]]
@@ -75,9 +76,24 @@ def apply(path, mapping):
     changed = int((sub.name_core != df.loc[m, "name_core"]).sum())
     for c in sub.columns:
         df.loc[m, c] = sub[c].to_numpy()
+    return df, changed
+
+
+def apply(path, mapping):
+    """Rewrite the file in pieces of 500k rows (keeps memory low)."""
     tmp = path.with_name(path.name + ".tmp")
-    df.to_parquet(tmp, index=False)
-    os.replace(tmp, path)
+    src = pq.ParquetFile(path)
+    writer, changed = None, 0
+    for batch in src.iter_batches(batch_size=500_000):
+        df, n = _apply_df(batch.to_pandas(), mapping)
+        changed += n
+        table = pa.Table.from_pandas(df, preserve_index=False)
+        if writer is None:
+            writer = pq.ParquetWriter(tmp, table.schema)
+        writer.write_table(table.cast(writer.schema))
+    if writer is not None:
+        writer.close()
+        os.replace(tmp, path)
     return changed
 
 
