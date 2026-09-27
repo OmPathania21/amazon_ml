@@ -8,14 +8,24 @@
 
 ## 1. Executive Summary
 
-We built a CPU-only pipeline that scales to the full dataset. The steps are:
+We built a CPU-only pipeline that scales to the full dataset (12.5M training records and 11.7M test records on a 16 GB laptop). It has four parts:
 
 - **Normalization:** rule-based cleaning of names and addresses that works for any country.
-- **Blocking:** IDF-weighted token blocking run from the Source-2/3 side (TF-IDF cosine, sparse top-k), which cuts 11.8 trillion possible pairs to about 49M candidates.
-- **Matching:** a LightGBM classifier on 61 pair features, trained with 5-fold cross-validation grouped by Source-1 entity.
+- **Three-pass blocking:** separate TF-IDF searches over combined, name and address tokens, whose results are merged and then pruned.
+- **Matching model:** a LightGBM classifier on 73 pair features, trained with 5-fold cross-validation grouped by Source-1 entity.
 - **Decision rule:** each S2/S3 record goes to at most one S1 entity (the one-owner rule), and matches are then selected per entity by maximizing expected F0.5.
 
-On held-out training entities the pipeline reaches **macro F0.5 = 0.919**, with **pair precision 0.994** and pair recall 0.831. The error analysis shows that the remaining loss comes mainly from blocking recall (86%), not from the matching model.
+Results on held-out training entities:
+
+| Measure | Value |
+|---|---|
+| Macro F0.5 | **0.974** |
+| Pair precision | 0.995 |
+| Pair recall | 0.939 |
+| Blocking recall | 96.7% |
+| Candidates per S1 entity (mean) | 16.6 |
+
+The three-pass blocking design was the single largest improvement. It came directly out of our error analysis of a first version, which had one blocking search: blocking recall rose from 86.0% to 96.7%, the candidate set shrank by 25%, and macro F0.5 rose from 0.919 to 0.974.
 
 ---
 
@@ -27,13 +37,13 @@ Key facts found during exploratory analysis (training set):
 
 | Fact | Value | Consequence for the design |
 |---|---|---|
-| Records | S1 2.21M, S2 5.03M, S3 5.29M (test: 1.73M / 4.89M / 5.08M) | All-pairs comparison is impossible, so blocking is required |
+| Records | S1 2.21M, S2 5.03M, S3 5.29M (test: 1.73M / 4.89M / 5.08M) | All-pairs comparison (11.8 × 10^12 same-country pairs in train) is impossible, so blocking is required |
 | Matches per S1 entity | mean 3.46; **5.6% singletons** | Recall matters, but a false match on a singleton scores 0 |
 | **Each S2/S3 record matches at most one S1 entity** | 7,638,365 matched IDs, all unique | Enables the **one-owner rule** and blocking from the S2/S3 side |
 | Unmatched S2/S3 records ("decoys") | ~26% | Blocking pulls in look-alikes, and the model must reject them |
 | Matches across countries | 0 | Blocking and features are computed within each country label |
-| Countries | train US + India; **test adds France (18% of test S1)** | No country-specific model inputs; country is only used to group records |
-| Name noise | abbreviations, legal suffixes, "doing business as" names, typos with digits (`C0mpany`, `8usiness`), word order, junk prefixes (`--`, `<<`), bracketed words, domain names (`ipower.com`), generic words appended (`Services`, `Partners`, `(India)`), **names in Indian scripts** (Devanagari, Telugu, Kannada, Tamil, Bengali, Malayalam, Gujarati, Gurmukhi, Odia) | Normalization, consonant-skeleton tokens, multiple fuzzy views |
+| Countries | train US + India; **test adds France (15% of test S1)** | No country-specific model inputs; country is only used to group records |
+| Name noise | abbreviations, legal suffixes, "doing business as" names, typos with digits (`C0mpany`, `8usiness`), word order, junk prefixes (`--`, `<<`, `***`), bracketed words, domain names (`ipower.com`), appended generic words (`Services`, `Partners`, `(India)`), **names written in Indian scripts** | Normalization, consonant-skeleton tokens, multiple fuzzy views |
 | Address noise | abbreviations, reordered components, zero-padded house numbers (`00709`), `H.No/Door No/Plot No` labels, landmarks (`Near SBI ATM`), states written as names, codes or native script (`महाराष्ट्र`, `TG`), `CDP` suffixes, broken characters (`Â\x80\x93`), **~3.4% empty addresses** | Address parsed into components (house number, postcode, state, landmark, tokens) |
 | Phone numbers | **not present** in the data (only name, address and country) | No phone features |
 
@@ -41,17 +51,18 @@ Key facts found during exploratory analysis (training set):
 
 **Approach Type:** Blocking + classifier + constrained decision rule (hybrid rule/ML pipeline)
 
-**Core Innovation:** Three ideas carry most of the design:
+**Core Innovation:**
 
-1. **Blocking from the S2/S3 side.** Because each S2/S3 record belongs to at most one S1 entity, every S2/S3 record retrieves only its top-5 S1 candidates.
-2. **Ranking features.** Features describe each candidate relative to the other candidates of the same S2/S3 record: its rank, and its score gap to the best candidate.
-3. **One-owner assignment plus expected-F0.5 selection.** After scoring, each S2/S3 record keeps only its best S1 entity. For each S1 entity we then choose the number of top candidates that maximizes expected F0.5, and predicting nothing is one of the options.
+1. **Three-pass blocking with combined tokens.** Single words stop being selective at millions of records. Tokens such as *house number × name skeleton* or *postcode × name skeleton* stay rare, so they pin down the right business even at full scale. Separate name-only and address-only passes cover records with an empty address or a completely different trade name.
+2. **Blocking from the S2/S3 side.** Each S2/S3 record belongs to at most one S1 entity, so every S2/S3 record retrieves only a handful of S1 candidates. This keeps the candidate set small.
+3. **Relative and cross-source features.** Features describe each candidate relative to the other candidates of the same record (rank, score gap). They also compare it with the S1 entity's strongest other candidate: S2 and S3 records of the same business agree with each other.
+4. **One-owner assignment plus expected-F0.5 selection.** After scoring, each S2/S3 record keeps only its best S1 entity. For each S1 entity we then choose the number of top candidates that maximizes expected F0.5, and predicting nothing is one of the options.
 
 Pipeline:
 
 ```
-raw TSV ──► 01 clean ──► 03 block (top-5 per S2/S3, per country) ──► 04 features (61)
-        ──► 05 LightGBM (5-fold, grouped by S1) ──► 06 tune decision rule on out-of-fold F0.5
+raw TSV ──► 01 clean ──► 03 block (3 passes: combo / name / addr, union + pruning, per country)
+        ──► 04 features (73) ──► 05 LightGBM (5-fold, grouped by S1) ──► 06 tune decision rule on OOF F0.5
         ──► 07 score test pairs (average of 5 models) ──► 08 one-owner + decision rule ──► TSVs
 ```
 
@@ -62,96 +73,103 @@ raw TSV ──► 01 clean ──► 03 block (top-5 per S2/S3, per country) ─
 **Normalization first (`normalize.py`, identical for train and test and for every country):**
 
 - **Names:**
-  - convert to ASCII (`unidecode`; Indian scripts and accents become Latin letters) and remove broken characters;
+  - convert to ASCII (`unidecode`; Indian scripts and accents become Latin letters), remove broken characters, and flag names written in a non-Latin script;
   - collapse dotted acronyms (`L.L.C.` → `llc`);
   - `&`/`+` → `and`;
   - fix digit-for-letter typos inside words;
   - strip `M/s`;
-  - split "doing business as" names (`dba`, `d/b/a`, `trading as`, …) into a main name and an alternative name;
+  - split "doing business as" names (`dba`, `d/b/a`, `trading as`, …) into a main and an alternative name;
   - detect domain names;
   - map words to canonical forms (`limited→ltd`, `private→pvt`, `corporation→corp`, `centre→center`, …);
   - pull legal suffixes into a separate field (incl. French `SARL/SAS/EURL`), also when written in Indian scripts, via their consonant skeleton;
   - produce: core name, key name (core without generic words), consonant skeleton (`raam maarketting` → `rm mrktng` = `ram marketing`), and the name with spaces removed.
 - **Addresses:**
   - convert to ASCII;
-  - rejoin 6-digit PINs split by a space (`400 021`);
+  - rejoin 6-digit PINs split by a space;
   - strip `cdp`;
-  - split on commas, and map state/region names and codes to one code (US states, Indian states incl. native-script spellings, French regions and departments), then remove them from the address text;
+  - split on commas, map state/region names and codes to one code (US states, Indian states incl. native-script spellings, French regions and departments), and remove them from the address text;
   - move landmark phrases into their own field;
   - remove number labels, rejoin compound house numbers (`5-513/4`), and strip leading zeros;
   - canonicalize street words (`street/str/saint→st`, `road→rd`, `boulevard/bd→blvd`, `rue`, `allee`, …);
-  - extract house number, postcode (5–6 digits, not the leading house number), and all numbers.
+  - extract house number, postcode and all numbers.
 
-**Blocking keys used:** For each record, a set of prefixed tokens:
-- core and alternative name words;
-- name consonant skeletons;
-- the name with spaces removed;
-- address words (≥3 characters);
-- house number;
-- postcode;
-- all numbers of ≥2 digits.
+**Blocking keys used.** Each record gets three token sets, stored as stable 64-bit hashes, one per pass:
+
+| Pass | Tokens | What it catches |
+|---|---|---|
+| **combo** | house/unit number × name skeleton, postcode × name skeleton, street word × name skeleton, pairs of name skeletons, joined name | Most matches, even when every single word is common |
+| **name** | name words, consonant skeletons, skeleton pairs, joined name | Records with an **empty address** |
+| **addr** | address words, house number, postcode, numbers, number × street-word pairs | **Different trade names** at the same address |
 
 **How candidates are retrieved:**
-- Tokens are weighted by IDF over Source 1, per country.
-- Tokens present in more than `MAX_DF = 400` S1 records are dropped.
-- Every S2/S3 record retrieves its **top-5 S1 records by TF-IDF cosine**, using a multithreaded sparse top-k matrix product (`sparse_dot_topn`) in chunks of 50k queries.
+
+1. Per country and per pass, tokens are weighted by IDF over Source 1.
+2. Tokens present in more S1 records than `max(400, 0.3% of the country's S1 count)` are dropped. The cap grows with the data, so a cap tuned on a small sample does not over-prune at full scale.
+3. Every S2/S3 record retrieves its **top-3 S1 records per pass** by TF-IDF cosine, using a multithreaded sparse top-k matrix product (`sparse_dot_topn`) in chunks of 50k queries.
+4. Within a pass, a candidate that is not the pass's best is kept only if its score is ≥ 0.75 × the best score.
+5. The three lists are merged. Each pair keeps its three pass scores, their sum, its rank and the number of passes that found it; all of these become model features.
 
 **Candidate pairs generated:**
 
 | | Train | Test |
 |---|---|---|
-| Candidate pairs | 48,923,447 | 48,444,503 |
-| All same-country S1 × S2/S3 pairs | 11.84 × 10^12 | ≈ 6.7 × 10^12 |
-| Reduction ratio | 0.9999959 | ≈ 0.9999928 |
-| Candidates per S1 entity (mean / median / p95) | 22.2 / 8 / 80 | ~28 mean |
-| Blocking time on a 16 GB laptop | ~4 min | ~4 min |
+| Candidate pairs | 36,642,595 | 36,809,656 |
+| All same-country S1 × S2/S3 pairs | 11.84 × 10^12 | 6.72 × 10^12 |
+| Reduction ratio | 0.9999969 | 0.9999945 |
+| Candidates per S1 entity (mean / median / p95) | 16.6 / 9 / 42 | 21.2 / 12 / 58 |
+| S1 entities without any candidate | 0.04% | 0.02% |
+| Blocking time on a 16 GB laptop | ~20 min | ~10 min |
 
-**How we ensured true matches were not lost:**
-- We retrieve from the S2/S3 side, which uses the one-owner property: each S2/S3 record only needs its single true owner among its candidates.
-- Several complementary token types are used: exact words, consonant skeletons for transliteration and typos, the joined name for domains, and numbers and postcodes.
-- Recall was measured on training data:
+The test set has more S2/S3 records per S1 entity than the training set (5.75 vs 4.68), which explains its larger candidate count per entity.
 
-| Blocking recall | top-1 | top-3 | top-5 |
+**How we ensured true matches were not lost.** We measured blocking recall on the training ground truth and iterated on the design using error analysis:
+
+| Blocking version | Recall | Candidates per S1 (mean) | F0.5 ceiling |
 |---|---|---|---|
-| Full training data | 0.792 | 0.842 | **0.860** |
-| 5% trial (lower density) | 0.971 | 0.983 | 0.987 |
+| v1: one TF-IDF pass, fixed df cap 400, top-5 | 0.860 | 22.2 | 0.936 |
+| **v2: three passes, combined tokens, scaling cap, pruning (submitted)** | **0.967** (India 0.953, US 0.977) | **16.6** | **0.989** |
 
-**Limitation (quantified in Section 5):** the `MAX_DF` cap was tuned on the 5% trial. At full scale, many informative tokens (street names, house numbers, common name words) exceed 400 S1 records and are dropped. As a result, blocking recall is 86% and the F0.5 ceiling is 0.936.
+- Recall per pass on its own: combo 0.903, addr 0.806, name 0.594.
+- The union adds the pairs that only one pass can find.
+- The error analysis of v1 showed why its recall was low. For 40% of the missed pairs, all shared tokens had been removed by the fixed cap (for example `k_invstmnts`, found in 7,667 S1 records). The other 60% were outranked by look-alikes.
 
 ---
 
 ## 4. Matching Model
 
-**Features used (61, all computed with `rapidfuzz`, vectorized and multithreaded):**
+**Features used (73, computed with `rapidfuzz`, vectorized and multithreaded):**
 
 - **Name features:**
   - token-set, token-sort, plain and partial ratios, and Jaro-Winkler on the core name;
   - token-set ratio on the full name and on the key name (generic words removed);
   - token-set and plain ratio on consonant skeletons;
-  - ratio and partial ratio on the name with spaces removed (for domain names);
+  - ratio and partial ratio on the name with spaces removed (domains);
   - best score over the "doing business as" alternatives;
   - legal suffix equal / conflicting / missing;
   - first key word equal;
   - domain flags;
+  - non-Latin-script flags;
   - name lengths and token counts.
 - **Address features:**
   - token-set, token-sort, plain and partial ratios;
   - state equal / conflicting / missing;
   - postcode equal / conflicting / missing;
-  - house number equal / conflicting / missing / partial (one number contains the other);
+  - house number equal / conflicting / missing / partial;
+  - **numeric house-number difference** (absolute and relative) and numeric equality;
   - Jaccard similarity and count of shared numbers;
-  - empty-address flags for each side;
+  - empty-address flags;
   - landmark flag.
 - **Blocking and ranking features:**
-  - TF-IDF cosine score;
+  - summed and per-pass scores (combo, name, addr);
+  - number of passes that found the pair;
   - rank among the S2/S3 record's candidates;
   - gap to the next and to the best candidate;
-  - ratio to the best score;
+  - ratio to the best;
   - number of candidates;
-  - on the S1 side: number of candidates, rank, and ratio to the best;
-  - number of S2/S3 records for which this S1 is the top candidate;
+  - on the S1 side: number of candidates, rank, ratio to the best, and number of records for which it is the top candidate;
   - source (S2 or S3);
   - relative string features: name, address and combined similarity minus the best value among the same record's candidates, plus the combined-similarity rank.
+- **Cross-source ("partner") features:** name and address similarity between the candidate and the S1 entity's strongest other candidate, plus that candidate's score. These help records with an empty address, whose partner in the other source confirms the business.
 
 The country label is **never** used as a feature.
 
@@ -159,35 +177,36 @@ Most important features by gain:
 
 | Feature | Gain share |
 |---|---|
-| combined similarity relative to best candidate | 0.47 |
-| address token-set ratio | 0.13 |
-| combined name+address similarity | 0.11 |
-| rank of combined similarity | 0.06 |
-| shared-number Jaccard | 0.04 |
+| combined similarity relative to best candidate | 0.42 |
+| blocking score (sum of passes) | 0.20 |
+| shared-number Jaccard | 0.08 |
+| house-number numeric difference | 0.04 |
+| address token-set ratio | 0.04 |
+| combined-similarity rank | 0.04 |
 
 **Model type:** LightGBM binary classifier (MIT licence, no pretrained models, far below the 8B-parameter limit).
 
 | Parameter | Value |
 |---|---|
 | num_leaves | 127 |
-| learning_rate | 0.05 |
+| learning_rate | 0.1 |
 | min_data_in_leaf | 200 |
 | feature_fraction | 0.8 |
 | bagging_fraction | 0.8 |
 | lambda_l2 | 1.0 |
-| Early stopping | 100 rounds, up to 3000 rounds |
+| Early stopping | 50 rounds, up to 2000 rounds |
 
 - **5-fold cross-validation grouped by Source-1 entity.** Folds come from a deterministic hash of the entity ID, so they are identical on every machine.
-- Each fold trains on 6M uniformly sampled pairs, which keeps the probabilities calibrated.
-- Best iterations were 1250–1891, with validation AUC 0.9998.
+- Each fold trains on 6M uniformly sampled pairs (the probabilities stay calibrated). Out-of-fold predictions are produced for **all** 36.6M training pairs.
+- Best iterations were 869–1163, with validation AUC 0.99975.
 - The test set is scored by averaging the 5 fold models.
 
 **Threshold selection method:** Directly optimize macro F0.5 on the **out-of-fold** predictions of all 2.2M training entities:
 
 1. **One-owner rule:** each S2/S3 record keeps only its highest-probability S1 entity.
 2. We compared two decision rules on the out-of-fold predictions:
-   - **(a) a global probability threshold** (best: 0.65, F0.5 0.91901);
-   - **(b) per-entity expected-F0.5 selection** (chosen: F0.5 0.91921). For each S1 entity, sort its candidates by probability p and choose k to maximize `1.25·Σ_{i≤k} p_i / (0.25·Σ p + k)`. Compare this with the expected score of predicting nothing, `Π(1 − p_i)`, which protects singletons. A probability floor of 0.6 is applied first.
+   - **(a) a global probability threshold** (best: 0.70, F0.5 0.97434);
+   - **(b) per-entity expected-F0.5 selection** (chosen: F0.5 0.97448). For each S1 entity, sort its candidates by probability p and choose k to maximize `1.25·Σ_{i≤k} p_i / (0.25·Σ p + k)`. Compare this with the expected score of predicting nothing, `Π(1 − p_i)`, which protects singletons. A probability floor of 0.6 is applied first.
 
 ---
 
@@ -195,77 +214,77 @@ Most important features by gain:
 
 **Validation (out-of-fold, all 2,206,821 training S1 entities):**
 
-| Metric | Value |
-|---|---|
-| **Macro F0.5** | **0.91921** (India 0.9209, US 0.9181) |
-| Pair precision | 0.9938 |
-| Pair recall | 0.8310 |
-| Singletons correctly predicted empty | 96.8% |
-| F0.5 ceiling given our candidates | 0.93647 |
+| Metric | v1 (one-pass blocking) | **Submitted (v2)** |
+|---|---|---|
+| **Macro F0.5** | 0.919 | **0.97448** |
+| Macro F0.5, India / US | 0.921 / 0.918 | **0.967 / 0.980** |
+| Pair precision | 0.994 | **0.995** |
+| Pair recall | 0.831 | **0.939** |
+| Singletons correctly predicted empty | 96.8% | **97.0%** |
+| F0.5 ceiling given our candidates | 0.936 | **0.989** |
 
-**Test-set sanity check (full models):**
-- 3.03 matches per S1 entity, with **France 3.03**, India 2.98 and US 3.13;
-- 7.4% of entities predicted empty.
-
-France, which never appears in training, behaves like the training countries.
+**Test-set sanity check (submitted file):**
+- 3.29 matches per S1 entity. Validation predicts 3.46 × 0.939 ÷ 0.995 ≈ 3.27.
+- 5.8% of entities predicted empty, against a true singleton rate of 5.6%.
+- **France 3.38**, India 3.23, US 3.33 matches per entity. France, which never appears in training, behaves like the training countries.
 
 **Pair-level confusion (out-of-fold):**
 
 | Outcome | Pairs | Share |
 |---|---|---|
-| TP (true match, predicted) | 6,347,409 | 83.1% of true pairs |
-| FP (wrong merge) | 39,669 | 0.62% of predicted pairs |
-| FN: lost at blocking | 1,066,988 | **14.0%** of true pairs |
-| FN: one-owner rule gave the record to another S1 | 39,158 | 0.5% |
-| FN: below the decision threshold | 184,810 | 2.4% |
+| TP (true match, predicted) | 7,172,391 | 93.9% of true pairs |
+| FP (wrong merge) | 36,694 | 0.51% of predicted pairs |
+| FN: lost at blocking | 249,654 | 3.3% of true pairs |
+| FN: one-owner rule gave the record to another S1 | 44,814 | 0.6% |
+| FN: below the decision threshold | 171,506 | 2.2% |
 
 **Entity-level outcomes:**
 
 | Outcome | S1 entities |
 |---|---|
-| Singleton, predicted empty (TN) | 119,296 |
-| Singleton, given a wrong match (FP) | 3,951 |
-| All matches found, no wrong ones | 1,254,702 |
-| Partly found, no wrong ones | 721,174 |
-| At least one wrong merge | 34,719 |
-| Has matches, predicted empty | 72,979 |
+| Singleton, predicted empty (TN) | 119,581 |
+| Singleton, given a wrong match (FP) | 3,666 |
+| All matches found, no wrong ones | 1,677,197 |
+| Partly found, no wrong ones | 362,734 |
+| At least one wrong merge | 32,029 |
+| Has matches, predicted empty | 11,614 |
 
 **Error rates by cause:**
 
 | Property | FP rate among predictions | True pairs lost at blocking | True pairs missed overall |
 |---|---|---|---|
-| Candidate address missing (4.4% of true pairs) | **4.7%** | **38.0%** | **60.8%** |
-| Names very different, token-set < 60 (9.6%) | 1.1% | 28.7% | 32.3% |
-| House-number conflict (22.0%) | 1.5% | 21.2% | 27.7% |
-| Candidate name is a domain (4.7%) | 0.1% | 19.0% | 19.4% |
-| State conflict (1.1%) | 0.6% | 15.5% | 18.4% |
-| Names similar, ≥ 90 (74.4%) | 0.5% | 9.1% | 12.1% |
+| Candidate address missing (4.4% of true pairs) | **3.3%** | **29.1%** | **54.2%** |
+| Names very different, token-set < 60 (9.6%) | 0.8% | 10.1% | 14.0% |
+| House-number conflict (22.0%) | 1.1% | 5.0% | 10.3% |
+| Candidate name is a domain (4.7%) | 0.1% | 7.6% | 8.0% |
+| State conflict (1.1%) | 0.5% | 2.8% | 5.9% |
+| Names similar, ≥ 90 (74.4%) | 0.45% | 1.6% | 4.3% |
+| India / US | 0.7% / 0.4% | 4.7% / 2.3% | 7.7% / 5.1% |
+
+Recall by name similarity of the true pair rises from 0.85 (token-set < 40) to 0.96 (≥ 90). Compared with v1, recall on very dissimilar names went from 0.66 to 0.85.
 
 **Common false positives (wrong merges):**
-- **Same name, nearby house number** on the same street: `Katz Pelican Inc, 190 Wall St` vs `192 Wall St`, and `Adams Holding Company, 330` vs `334 Waterwheel Way`. The ground truth treats these as different entities, but they are nearly indistinguishable from name and address alone.
-- **Candidate with no address:** the name matches but there's nothing to confirm location (`Slater Generating`, `Continenta1 Apex`). This category has the highest FP rate, 4.7%.
-- **Same address, different business** (co-located businesses): `Bombay Ventures` vs `Umbradelta` at the same Bihar address.
+- **Near-identical business at the same address with a different legal form or an extra word**: `Mint Brush Public Limited` vs `Public Mint Brush Overseas Ltd`, `North Producer Limited` vs `North Producer Private Limited`, `Archana Brothers` vs `Archana Brothers Group`. The ground truth treats these as different entities, although name and address alone barely distinguish them.
+- **Candidate with no address:** the name matches but nothing confirms the location (`Bright Software Brands L.L.C.`, `Advanced (india) (Private)`). This category has the highest FP rate, 3.3%.
+- **Native-script names that share only a generic word:** `ஃபர்ஸ்ட் ஹாஸ்பிடாலிட்டி` ("First Hospitality") matched to `Tirupati Hospitality` at the same address.
 
 **Common false negatives (missed matches):**
-- **Lost at blocking (14%, the dominant error).**
-  - Records with **empty addresses** only have name tokens, and common name words are dropped by the df cap.
-  - **Completely different trade names** at the same address (`Excellent & Co` vs `Vioumbraumbra`) depend on address tokens that are too frequent at full scale.
-  - **Heavy typos** in rare tokens (`Naridoanl`, `Dhbaoon`) plus a changed house number (`11674` vs `11666`) leave too few shared tokens.
-- **Rejected by the model (2.4%).**
-  - House numbers differing by one digit (`100` vs `200 Pheasant Lane`), which the model has learned to distrust because of the false-positive pattern above.
-  - Names written in Indian scripts whose transliteration shares little with the English name (`यूनिक टेक्नोलॉजीज` vs `Unique Technologies`).
+- **Empty addresses** remain the hardest case: 29% are lost at blocking, because only name tokens are available and typos (`Hutton Nrvona` for `Hutton Nevada`) or truncated names (`Siddhi &`) leave too few rare tokens.
+- **Names written in Indian scripts:** `न्यू सॉल्यूशंस प्राइवेट लिमिटेड` for `New Solutions Pvt Ltd`, and `ஸ்டார் ஃபுட்` for `Star Food`. After unidecode, their words share little with the English name. This is the main reason India (0.967) trails the US (0.980).
+- **Completely different trade names at the same address** (`Big Coffee` vs `Zephcirajax`, `Grand Infrastructure Studios` vs `Avionyxiri`). The model keeps them below the threshold because the same pattern (same address, different name) also produces false positives.
 
 ---
 
 ## 6. Conclusion
 
-- A scalable pipeline (normalization, IDF token blocking, LightGBM with ranking features, and a one-owner, expected-F0.5 decision rule) resolves the full dataset on a 16 GB laptop without a GPU. It reaches validation macro F0.5 = 0.919 at 99.4% pair precision, and transfers to the unseen French data.
-- The error analysis shows the matcher is within 0.017 of the ceiling set by its candidates. The largest remaining gain is in **blocking**: 86% recall, with too many candidates per entity.
-- Next steps:
-  - composite tokens that stay rare at scale (house number + street, name bigrams, postcode + name);
-  - a document-frequency cap that scales with the data;
-  - an adaptive number of candidates;
-  - multilingual sentence embeddings (e.g. `multilingual-e5-small`, MIT) as an extra blocking signal and extra feature, which would help native-script and very different names.
+- A scalable, CPU-only pipeline resolves the full dataset on a 16 GB laptop and reaches validation macro F0.5 = 0.974 at 99.5% pair precision. The pipeline combines normalization, three-pass combined-token blocking, LightGBM with ranking and cross-source features, and a one-owner, expected-F0.5 decision rule.
+- The blocking design came from error analysis:
+  - blocking recall rose from 86.0% to 96.7%;
+  - the candidate set shrank to 16.6 per S1 entity;
+  - the matcher is now within 0.014 of the 0.989 ceiling set by its candidates.
+- Remaining errors concentrate on empty addresses and names written in Indian scripts. Planned next steps:
+  - the learned transliteration dictionary already included in `02b_translit.py` (native-script word → English word, learned from training pairs only; not used in the submitted run);
+  - multilingual sentence embeddings (e.g. `multilingual-e5-small`, MIT) as a fourth blocking pass and an extra feature.
 
 ---
 
@@ -281,13 +300,14 @@ France, which never appears in training, behaves like the training countries.
 | File | Role |
 |---|---|
 | `00_download_data.py` | Downloads the challenge zip and arranges `data/train`, `data/test` |
-| `config.py` | Paths, all hyper-parameters, fold hashing, sample mode |
-| `normalize.py` | Every cleaning rule (`python src/normalize.py` prints worked examples) |
-| `features.py` | Pair features, ranking features |
+| `config.py` | Paths, all hyper-parameters (blocking passes, caps, LightGBM), fold hashing, sample mode |
+| `normalize.py` | Every cleaning rule and the three blocking token sets (`python src/normalize.py` prints worked examples) |
+| `features.py` | Pair, ranking, house-number and partner features |
 | `metrics.py` | Macro F0.5, one-owner rule, threshold and expected-F0.5 decision rules |
-| `01_clean.py` | Raw TSV → cleaned Parquet per source (multiprocessing) |
+| `01_clean.py` | Raw TSV → cleaned Parquet per source (multiprocessing, written in 500k-row pieces) |
 | `02_labels_folds.py` | Ground-truth lookup + 5 folds grouped by S1 entity |
-| `03_block.py` | Per-country TF-IDF token blocking, top-5 per S2/S3 record; reports blocking recall |
+| `02b_translit.py` | *Optional, not used for the submitted results:* learned native-script → English word dictionary |
+| `03_block.py` | Three-pass per-country TF-IDF blocking, union + pruning; reports blocking recall |
 | `04_features.py` | Features for every candidate pair, in 1M-pair chunks |
 | `05_train.py` | LightGBM 5-fold training, out-of-fold predictions, feature importance |
 | `06_tune.py` | Decision-rule search on out-of-fold macro F0.5 |
@@ -296,7 +316,7 @@ France, which never appears in training, behaves like the training countries.
 | `09_error_analysis.py` | This section's confusion tables, causes and examples |
 | `10_make_zip.py` | Builds the submission package |
 
-To reproduce both output files:
+To reproduce the submitted output files:
 
 ```
 python src/00_download_data.py
@@ -309,30 +329,26 @@ python src/04_features.py --split test && python src/07_predict.py && python src
 ### B. Additional Results
 
 **Runtime on an Intel i5-13420H laptop (8 cores / 12 threads, 16 GB RAM, CPU only).**
-Step times below are the core compute time printed by the pipeline's own timers. They exclude
-loading and saving the intermediate Parquet files (several GB per step), the blocking-recall
-report, script start-up and the gaps between steps, so the real end-to-end wall-clock time was
-noticeably longer than the totals shown.
+Step times below are the core compute time printed by the pipeline's own timers. They exclude loading and saving the intermediate Parquet files (several GB per step), the blocking-recall report, script start-up and the gaps between steps, so the real end-to-end wall-clock time was noticeably longer than the totals shown.
 
 | Step | Train | Test |
 |---|---|---|
-| Cleaning (12.5M / 11.7M records) | 6.5 min | ~4 min |
+| Cleaning (12.5M / 11.7M records) | 4.2 min | 4.1 min |
 | Labels + folds | 0.2 min | – |
-| Blocking | 4.1 min | 3.9 min |
-| Features (48.9M / 48.4M pairs) | 13.8 min | 14.0 min |
-| LightGBM, 5 folds (60 min training + 21 min out-of-fold prediction) | 81 min | – |
-| Decision-rule search | 2.9 min | – |
-| Test scoring (5 models × 48.4M pairs) | – | 106 min |
-| **Total measured compute** | **~1 h 50 min** | **~2 h 8 min** |
+| Blocking, 3 passes | ~20 min | 9.9 min |
+| Features (36.6M / 36.8M pairs) | 14.2 min | 13.8 min |
+| LightGBM, 5 folds (46 min training + 10 min out-of-fold prediction) | 56 min | – |
+| Decision-rule search | 3.0 min | – |
+| Test scoring (5 models × 36.8M pairs) | – | 45.7 min |
+| **Total measured compute** | **~1 h 40 min** | **~1 h 15 min** |
 
-The whole train + test pipeline therefore needs roughly **4 hours of measured compute**, plus
-file loading and saving, on a single 16 GB laptop. Scoring is the slowest step (the full models
-have 1,250–1,900 trees each) and would be the first to parallelise or move to a GPU at larger scale.
+The whole train + test pipeline needs roughly **3 hours of measured compute**, plus file loading and saving, on a single 16 GB laptop. Test scoring became 2.3× faster than in v1 (106 → 46 min), because the candidate set is smaller and the models use fewer trees.
 
 **Reproducibility:**
-- Deterministic hash-based folds and sampling.
+- Deterministic hash-based folds, sampling and blocking-token hashing.
 - Fixed seeds (`SEED = 42`).
 - Pinned package versions.
+- Cleaning and blocking are written crash-safely (temporary file, then rename).
 - A `--sample 0.05` mode reruns the whole training pipeline on 5% of the entities in about 10 minutes.
 
 **Fair play:**
