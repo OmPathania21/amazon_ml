@@ -13,19 +13,19 @@ We built a CPU-only pipeline that scales to the full dataset (12.5M training rec
 - **Normalization:** rule-based cleaning of names and addresses that works for any country.
 - **Three-pass blocking:** separate TF-IDF searches over combined, name and address tokens, whose results are merged and then pruned.
 - **Matching model:** a LightGBM classifier on 73 pair features, trained with 5-fold cross-validation grouped by Source-1 entity.
-- **Decision rule:** each S2/S3 record goes to at most one S1 entity (the one-owner rule), and matches are then selected per entity by maximizing expected F0.5.
+- **Decision rule:** a small second-stage LightGBM re-scores each pair from its probability in context (rank and gap among the other candidates of the same entity and record). Each S2/S3 record then goes to at most one S1 entity (the one-owner rule), and matches are selected per entity by maximizing expected F0.5.
 
 Results on held-out training entities:
 
 | Measure | Value |
 |---|---|
-| Macro F0.5 | **0.974** |
+| Macro F0.5 | **0.975** (0.97536) |
 | Pair precision | 0.995 |
 | Pair recall | 0.939 |
 | Blocking recall | 96.7% |
 | Candidates per S1 entity (mean) | 16.6 |
 
-The three-pass blocking design was the single largest improvement. It came directly out of our error analysis of a first version, which had one blocking search: blocking recall rose from 86.0% to 96.7%, the candidate set shrank by 25%, and macro F0.5 rose from 0.919 to 0.974.
+The three-pass blocking design was the single largest improvement. It came directly out of our error analysis of a first version, which had one blocking search: blocking recall rose from 86.0% to 96.7%, the candidate set shrank by 25%, and macro F0.5 rose from 0.919 to 0.974. A second-stage re-scoring model then added +0.0008, for 0.975.
 
 ---
 
@@ -63,7 +63,8 @@ Pipeline:
 ```
 raw TSV ──► 01 clean ──► 03 block (3 passes: combo / name / addr, union + pruning, per country)
         ──► 04 features (73) ──► 05 LightGBM (5-fold, grouped by S1) ──► 06 tune decision rule on OOF F0.5
-        ──► 07 score test pairs (average of 5 models) ──► 08 one-owner + decision rule ──► TSVs
+        ──► 07 score test pairs (average of 5 models) ──► 06c second-stage re-scoring (5-fold)
+        ──► 08 one-owner + decision rule ──► TSVs
 ```
 
 ---
@@ -206,7 +207,15 @@ Most important features by gain:
 1. **One-owner rule:** each S2/S3 record keeps only its highest-probability S1 entity.
 2. We compared two decision rules on the out-of-fold predictions:
    - **(a) a global probability threshold** (best: 0.70, F0.5 0.97434);
-   - **(b) per-entity expected-F0.5 selection** (chosen: F0.5 0.97448). For each S1 entity, sort its candidates by probability p and choose k to maximize `1.25·Σ_{i≤k} p_i / (0.25·Σ p + k)`. Compare this with the expected score of predicting nothing, `Π(1 − p_i)`, which protects singletons. A probability floor of 0.6 is applied first.
+   - **(b) per-entity expected-F0.5 selection** (F0.5 0.97448). Tuning the floor separately for India and the US gave 0.97457. For each S1 entity, sort its candidates by probability p and choose k to maximize `1.25·Σ_{i≤k} p_i / (0.25·Σ p + k)`. Compare this with the expected score of predicting nothing, `Π(1 − p_i)`, which protects singletons. A probability floor of 0.6 is applied first.
+
+**Second-stage re-scoring (`06c_stack.py`).** A small LightGBM (63 leaves, about 100–150 trees) is trained with the same 5 folds on the out-of-fold probabilities. It uses 17 context features:
+- the probability and its logit;
+- for the pair's S1 entity and for its S2/S3 record: its rank, the gap to the best probability, the number of candidates, the maximum, the sum, and the count above 0.5;
+- the second-best probability of the record;
+- the pair's share of the entity's total probability.
+
+These features correct decisions where several candidates compete. The expected-F0.5 rule is then re-tuned (probability floor 0.525), and validation macro F0.5 rises from **0.97457 to 0.97536**. The stage is applied only because it improved the out-of-fold score.
 
 ---
 
@@ -216,7 +225,7 @@ Most important features by gain:
 
 | Metric | v1 (one-pass blocking) | **Submitted (v2)** |
 |---|---|---|
-| **Macro F0.5** | 0.919 | **0.97448** |
+| **Macro F0.5** | 0.919 | **0.97536** (0.97448 before re-scoring) |
 | Macro F0.5, India / US | 0.921 / 0.918 | **0.967 / 0.980** |
 | Pair precision | 0.994 | **0.995** |
 | Pair recall | 0.831 | **0.939** |
@@ -277,7 +286,7 @@ Recall by name similarity of the true pair rises from 0.85 (token-set < 40) to 0
 
 ## 6. Conclusion
 
-- A scalable, CPU-only pipeline resolves the full dataset on a 16 GB laptop and reaches validation macro F0.5 = 0.974 at 99.5% pair precision. The pipeline combines normalization, three-pass combined-token blocking, LightGBM with ranking and cross-source features, and a one-owner, expected-F0.5 decision rule.
+- A scalable, CPU-only pipeline resolves the full dataset on a 16 GB laptop and reaches validation macro F0.5 = 0.975 at 99.5% pair precision. The pipeline combines normalization, three-pass combined-token blocking, LightGBM with ranking and cross-source features, a second-stage re-scoring model, and a one-owner, expected-F0.5 decision rule.
 - The blocking design came from error analysis:
   - blocking recall rose from 86.0% to 96.7%;
   - the candidate set shrank to 16.6 per S1 entity;
@@ -310,7 +319,8 @@ Recall by name similarity of the true pair rises from 0.85 (token-set < 40) to 0
 | `03_block.py` | Three-pass per-country TF-IDF blocking, union + pruning; reports blocking recall |
 | `04_features.py` | Features for every candidate pair, in 1M-pair chunks |
 | `05_train.py` | LightGBM 5-fold training, out-of-fold predictions, feature importance |
-| `06_tune.py` | Decision-rule search on out-of-fold macro F0.5 |
+| `06_tune.py` | Decision-rule search on out-of-fold macro F0.5 (global and per country) |
+| `06c_stack.py` | Second-stage re-scoring model on the out-of-fold / test probabilities; used only if it improves validation F0.5 |
 | `07_predict.py` | Test scoring, average of the 5 models |
 | `08_write_submission.py` | Writes `matching_results.tsv` + `candidate_pairs.tsv`, runs the official validator |
 | `09_error_analysis.py` | This section's confusion tables, causes and examples |
@@ -323,7 +333,8 @@ python src/00_download_data.py
 python src/01_clean.py && python src/02_labels_folds.py && python src/03_block.py
 python src/04_features.py && python src/05_train.py && python src/06_tune.py
 python src/01_clean.py --split test && python src/03_block.py --split test
-python src/04_features.py --split test && python src/07_predict.py && python src/08_write_submission.py
+python src/04_features.py --split test && python src/07_predict.py
+python src/06c_stack.py && python src/08_write_submission.py
 ```
 
 ### B. Additional Results

@@ -66,6 +66,7 @@ python src/01_clean.py --split test
 python src/03_block.py --split test
 python src/04_features.py --split test
 python src/07_predict.py
+python src/06c_stack.py            # second-stage re-scoring (applied only if validation improves)
 python src/08_write_submission.py
 ```
 
@@ -110,6 +111,7 @@ exists; add `--force` to redo a step. Set `ER_JOBS=8` to limit CPU threads.
 | `src/04_features.py` | features for every candidate pair |
 | `src/05_train.py` | LightGBM 5-fold, out-of-fold predictions, models |
 | `src/06_tune.py` | decision rule search + validation macro F0.5 |
+| `src/06c_stack.py` | second-stage re-scoring of the probabilities; replaces test predictions only if validation F0.5 improves |
 | `src/07_predict.py` | score test pairs with the 5 fold models (averaged) |
 | `src/08_write_submission.py` | one-owner rule + decision rule → both TSVs → validator |
 | `src/09_error_analysis.py` | pair-level TP/FP/FN, entity outcomes, blocking quality, error causes, examples |
