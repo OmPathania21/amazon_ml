@@ -202,8 +202,6 @@ Most important features by gain:
 | Pair recall | 0.8310 |
 | Singletons correctly predicted empty | 96.8% |
 | F0.5 ceiling given our candidates | 0.93647 |
-| Leaderboard (public), full models | [fill in] |
-| Leaderboard (public), 5% trial models | [fill in] |
 
 **Test-set sanity check (full models):**
 - 3.03 matches per S1 entity, with **France 3.03**, India 2.98 and US 3.13;
@@ -310,15 +308,26 @@ python src/04_features.py --split test && python src/07_predict.py && python src
 
 ### B. Additional Results
 
-**Runtime on an Intel i5-13420H laptop (8 cores / 12 threads, 16 GB RAM, CPU only):**
+**Runtime on an Intel i5-13420H laptop (8 cores / 12 threads, 16 GB RAM, CPU only).**
+Step times below are the core compute time printed by the pipeline's own timers. They exclude
+loading and saving the intermediate Parquet files (several GB per step), the blocking-recall
+report, script start-up and the gaps between steps, so the real end-to-end wall-clock time was
+noticeably longer than the totals shown.
 
 | Step | Train | Test |
 |---|---|---|
 | Cleaning (12.5M / 11.7M records) | 6.5 min | ~4 min |
+| Labels + folds | 0.2 min | – |
 | Blocking | 4.1 min | 3.9 min |
 | Features (48.9M / 48.4M pairs) | 13.8 min | 14.0 min |
-| LightGBM, 5 folds (train + out-of-fold predict) | 81 min | – |
+| LightGBM, 5 folds (60 min training + 21 min out-of-fold prediction) | 81 min | – |
+| Decision-rule search | 2.9 min | – |
 | Test scoring (5 models × 48.4M pairs) | – | 106 min |
+| **Total measured compute** | **~1 h 50 min** | **~2 h 8 min** |
+
+The whole train + test pipeline therefore needs roughly **4 hours of measured compute**, plus
+file loading and saving, on a single 16 GB laptop. Scoring is the slowest step (the full models
+have 1,250–1,900 trees each) and would be the first to parallelise or move to a GPU at larger scale.
 
 **Reproducibility:**
 - Deterministic hash-based folds and sampling.

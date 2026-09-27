@@ -6,32 +6,34 @@ Pipeline: **clean → block → features → LightGBM (5-fold) → decision rule
 
 Use Python 3.13 (results were produced with Python 3.13.1 on Windows 11; `requirements.txt` pins the exact package versions).
 
+Run every command from this folder (the one containing `src/`, `README.md` and
+`requirements.txt`; in the submission zip that is `code/business_entity_resolution/`).
+
 ```bash
-git clone <repo-url>
-cd amazon_ml
 python -m venv .venv
 .venv\Scripts\activate           # Windows
 # source .venv/bin/activate      # Mac / Linux
 pip install -r requirements.txt
 ```
 
-The dataset is not in git (too big). Download and arrange it with:
+**Data.** Put the challenge dataset next to `src/` as:
+
+```
+data/train/train_source1.tsv  train_source2.tsv  train_source3.tsv  train_ground_truth.tsv
+data/test/test_source1.tsv    test_source2.tsv   test_source3.tsv
+```
+
+Either copy the organisers' `dataset/train` and `dataset/test` folders into `data/`, or
+let the script download the challenge zip from Google Drive and arrange it:
 
 ```bash
-python src/00_download_data.py
+python src/00_download_data.py                      # download + unzip + arrange
+python src/00_download_data.py --zip path/to/the.zip  # zip already downloaded
 ```
 
-It downloads the challenge zip from Google Drive, unzips it and produces:
-
-```
-amazon_ml/data/train/train_source1.tsv ... train_ground_truth.tsv
-amazon_ml/data/test/test_source1.tsv ...
-```
-
-If the download fails (Drive quota), download the zip in a browser from
-https://drive.google.com/file/d/10kOaB9eVp0096S069W8a8mT9-IEm3m8f/view and run
-`python src/00_download_data.py --zip path/to/the.zip`.
-(`student_resource/dataset/` is also picked up if it exists instead of `data/`.)
+(A `student_resource/dataset/` folder next to `src/` is also picked up instead of `data/`.)
+All outputs are written inside this folder: `work/` (intermediate files) and `output/`
+(`matching_results.tsv`, `candidate_pairs.tsv`).
 
 ## Run
 
